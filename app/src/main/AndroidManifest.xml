@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- ─── Permissions ─────────────────────────────────────────────────── -->
+    <!-- Audio capture for STT -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- Foreground service: required on API 28+ -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Microphone foreground-service type: required on API 34+ -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <!-- System actions dispatched by ActionDispatcher -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <!-- Battery / device stats (no special permission needed, but declared for clarity) -->
+    <!-- Vibration for haptic feedback -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Post notifications: required on API 33+ -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Wake lock: keeps CPU alive during inference -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.VoiceAssistant"
+        android:largeHeap="true">
+
+        <!-- ─── Main Activity ───────────────────────────────────────────── -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="stateHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- ─── Foreground Service ──────────────────────────────────────── -->
+        <!--
+            foregroundServiceType="microphone" is mandatory for API 34+.
+            Without it Android kills the service when it tries to use AudioRecord.
+        -->
+        <service
+            android:name=".VoiceAssistantService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
+    </application>
+</manifest>

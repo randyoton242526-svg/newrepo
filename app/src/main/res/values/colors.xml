@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Primary brand colour (mic button, header) -->
+    <color name="primary">#1976D2</color>
+    <color name="primary_dark">#1565C0</color>
+    <color name="primary_light">#BBDEFB</color>
+    <color name="on_primary">#FFFFFF</color>
+
+    <!-- Surface colours -->
+    <color name="background">#F5F5F5</color>
+    <color name="surface">#FFFFFF</color>
+    <color name="on_surface">#212121</color>
+    <color name="on_surface_secondary">#757575</color>
+
+    <!-- Bubble colours -->
+    <color name="bubble_user">#1976D2</color>
+    <color name="bubble_assistant">#F0F0F0</color>
+
+    <!-- Status / semantic -->
+    <color name="error">#D32F2F</color>
+    <color name="success">#388E3C</color>
+    <color name="warning">#F57C00</color>
+</resources>

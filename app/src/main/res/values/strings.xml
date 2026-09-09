@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Voice Assistant</string>
+    <string name="mic_button_desc">Tap to speak</string>
+    <string name="status_initialising">Initialising…</string>
+    <string name="status_idle">Tap to speak</string>
+    <string name="status_listening">🔴 Listening…</string>
+    <string name="status_processing">Processing…</string>
+    <string name="status_executing">Executing…</string>
+    <string name="status_error">⚠️ Error — check logs</string>
+    <string name="notification_channel_name">Voice Assistant Service</string>
+    <string name="notification_channel_desc">Shows when the voice assistant is active</string>
+    <string name="permission_audio_rationale">The microphone permission is needed so the assistant can hear you.</string>
+    <string name="model_missing_title">Model File Missing</string>
+    <string name="model_missing_message">Download a Gemma model file and copy it to:
+/files/models/gemma-2b-it-cpu-int8.bin
+
+See README for instructions.</string>
+    <string name="vosk_model_missing">Vosk speech model not found. Copy the model folder to /files/models/vosk-model/</string>
+</resources>

@@ -1,0 +1,20 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+        // Vosk AAR is hosted here
+        maven { url 'https://alphacephei.com/maven/' }
+        // JitPack for any community wrappers
+        maven { url 'https://jitpack.io' }
+    }
+}
+rootProject.name = "VoiceAssistantApp"
+include ':app'
