@@ -28,7 +28,7 @@ class VoiceAssistantService : Service() {
         const val MODEL_DIR_NAME        = "models"
         const val VOSK_MODEL_SUBDIR     = "vosk-model"
         private const val VOSK_ZIP_URL  =
-            "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
+            "https://alphacephei.com/vosk/models/vosk-model-en-us-0.22-lgraph.zip"
     }
 
     inner class LocalBinder : Binder() {
