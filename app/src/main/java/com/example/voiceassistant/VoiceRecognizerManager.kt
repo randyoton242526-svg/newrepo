@@ -25,8 +25,8 @@ class VoiceRecognizerManager(
 
     private var model: Model? = null
 
-    @Volatile private var isListening  = false
-    @Volatile private var manualStop   = false
+    @Volatile private var isListening = false
+    @Volatile private var manualStop  = false
 
     fun init() {
         try {
@@ -44,9 +44,7 @@ class VoiceRecognizerManager(
         if (isListening) return@withContext
         val mdl = model ?: run { onError("Model not initialised"); return@withContext }
 
-        // ── Create a FRESH Recognizer for every session ──────────────────
-        // Never reuse or reset a Recognizer while its loop may still be running.
-        // Vosk/Kaldi will SIGABRT if acceptWaveForm() is called after reset().
+        // Fresh Recognizer every session — never reuse after stop
         val rec = try {
             Recognizer(mdl, SAMPLE_RATE.toFloat())
         } catch (e: Exception) {
@@ -81,7 +79,9 @@ class VoiceRecognizerManager(
         ar.startRecording()
         Log.i(TAG, "Recording started")
 
-        val buf = ShortArray(bufSize / 2)
+        val buf   = ShortArray(bufSize / 2)
+        val bytes = ByteArray(bufSize)    // reused buffer
+
         try {
             while (isListening) {
                 val read = ar.read(buf, 0, buf.size)
@@ -89,21 +89,23 @@ class VoiceRecognizerManager(
 
                 // Amplitude for waveform UI
                 val sum = buf.take(read).sumOf { it.toDouble() * it }
-                val rms = Math.sqrt(sum / read).toFloat()
-                onAmplitude(rms / Short.MAX_VALUE)
+                onAmplitude((Math.sqrt(sum / read) / Short.MAX_VALUE).toFloat())
 
-                val bytes = ByteArray(read * 2)
+                // Convert shorts → bytes
                 for (i in 0 until read) {
                     bytes[i * 2]     = (buf[i].toInt() and 0xFF).toByte()
                     bytes[i * 2 + 1] = (buf[i].toInt() shr 8 and 0xFF).toByte()
                 }
+                val byteLen = read * 2
 
-                // Only feed audio to recognizer if we haven't been stopped
-                if (!manualStop) {
-                    if (rec.acceptWaveForm(bytes, bytes.size)) {
-                        val text = extractText(rec.result)
-                        if (text.isNotBlank()) onFinal(text)
-                    } else {
+                // Feed audio — always feed even if manualStop (so buffer is complete for result)
+                if (rec.acceptWaveForm(bytes, byteLen)) {
+                    // Natural end of utterance detected by Vosk
+                    val text = extractText(rec.result)
+                    Log.d(TAG, "Natural utterance: \"$text\"")
+                    if (text.isNotBlank()) onFinal(text)
+                } else {
+                    if (!manualStop) {
                         val partial = extractPartial(rec.partialResult)
                         if (partial.isNotBlank()) onPartial(partial)
                     }
@@ -113,10 +115,21 @@ class VoiceRecognizerManager(
             Log.e(TAG, "Recording loop error: ${e.message}", e)
             if (!manualStop) onError("Recording error: ${e.message}")
         } finally {
-            // Stop audio first
-            try { ar.stop() } catch (_: Exception) {}
+            // Stop audio hardware first
+            try { ar.stop()    } catch (_: Exception) {}
             try { ar.release() } catch (_: Exception) {}
-            // Close THIS session's recognizer (safe — loop has fully exited)
+
+            // ── Get whatever Vosk recognized up to stop point ───────────
+            // Use rec.result (NOT rec.finalResult) — safe, no FinalizeDecoding call
+            try {
+                val text = extractText(rec.result)
+                Log.d(TAG, "Result on stop: \"$text\"")
+                if (text.isNotBlank()) onFinal(text)
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not read result on stop: ${e.message}")
+            }
+
+            // Close THIS session's recognizer — safe because loop fully exited
             try { rec.close() } catch (_: Exception) {}
             Log.i(TAG, "Recording stopped")
         }
@@ -125,10 +138,8 @@ class VoiceRecognizerManager(
     fun stopListening() {
         manualStop = true
         isListening = false
-        // Do NOT touch the Recognizer here!
-        // The recording loop will see isListening=false, exit cleanly,
-        // and close the Recognizer itself in the finally block.
-        Log.i(TAG, "stopListening() called — manual stop, recognizer will close on loop exit")
+        // Do NOT touch rec here — let the loop exit and close it in finally
+        Log.i(TAG, "stopListening() called — will collect result on loop exit")
     }
 
     fun release() {
