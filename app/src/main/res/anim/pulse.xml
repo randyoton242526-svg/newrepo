@@ -1,32 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-  pulse.xml
-  ---------
-  Repeating scale + alpha animation applied to the mic button while listening.
-  Gives a gentle "heartbeat" effect to indicate active recording.
-  Applied / cleared via AnimationUtils.loadAnimation() in MainActivity.
--->
 <set xmlns:android="http://schemas.android.com/apk/res/android"
-    android:interpolator="@android:anim/accelerate_decelerate_interpolator">
+    android:interpolator="@android:anim/decelerate_interpolator">
 
-    <!-- Scale outward then back -->
     <scale
-        android:duration="700"
         android:fromXScale="1.0"
+        android:toXScale="1.15"
         android:fromYScale="1.0"
+        android:toYScale="1.15"
         android:pivotX="50%"
         android:pivotY="50%"
+        android:duration="600"
         android:repeatCount="infinite"
-        android:repeatMode="reverse"
-        android:toXScale="1.15"
-        android:toYScale="1.15" />
+        android:repeatMode="reverse" />
 
-    <!-- Fade slightly then back to full opacity -->
     <alpha
-        android:duration="700"
         android:fromAlpha="1.0"
+        android:toAlpha="0.6"
+        android:duration="600"
         android:repeatCount="infinite"
-        android:repeatMode="reverse"
-        android:toAlpha="0.75" />
+        android:repeatMode="reverse" />
 
 </set>
