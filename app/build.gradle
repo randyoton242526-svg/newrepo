@@ -69,8 +69,6 @@ dependencies {
     // if you prefer: replace with your llama.cpp Android wrapper dependency instead.
     implementation 'com.google.mediapipe:tasks-genai:0.10.14'
 
-    // llama.cpp JNI for GGUF model inference
-    implementation 'io.github.kherud:llama:3.1.1'
 
     // JSON parsing for LLM structured output
     implementation 'org.json:json:20231013'
