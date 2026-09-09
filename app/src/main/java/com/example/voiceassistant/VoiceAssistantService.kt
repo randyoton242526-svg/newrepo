@@ -8,51 +8,41 @@ import android.os.PowerManager
 import android.speech.tts.TextToSpeech
 import android.util.Log
 import kotlinx.coroutines.*
+import java.io.BufferedInputStream
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.Locale
+import java.util.zip.ZipInputStream
 
-/**
- * VoiceAssistantService  (FINAL — auto-download on first launch)
- * --------------------------------------------------------------
- * On startup this service:
- *   1. Calls startForeground() immediately (required by Android 14+).
- *   2. Checks if the GGUF model file already exists locally.
- *   3a. If MISSING  →  downloads it from the hardcoded Google Drive link,
- *       streaming live progress to the UI (status text + notification).
- *   3b. If PRESENT  →  skips straight to model init.
- *   4. Loads Vosk STT model.
- *   5. Loads the GGUF model via llama.cpp JNI.
- *   6. Transitions to IDLE — user can now tap the mic.
- *
- * No ADB, no manual file copying, no separate setup screen required.
- */
 class VoiceAssistantService : Service() {
 
     companion object {
-        private const val TAG              = "VAService"
-        const val EXTRA_RETRY              = "extra_retry"
-        const val MODEL_DIR_NAME           = "models"
-        const val VOSK_MODEL_SUBDIR        = "vosk-model"
+        private const val TAG           = "VAService"
+        const val EXTRA_RETRY           = "extra_retry"
+        const val MODEL_DIR_NAME        = "models"
+        const val VOSK_MODEL_SUBDIR     = "vosk-model"
+        private const val VOSK_ZIP_URL  =
+            "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
     }
 
-    // ---- Binder -------------------------------------------------------------
     inner class LocalBinder : Binder() {
         fun getService(): VoiceAssistantService = this@VoiceAssistantService
     }
     private val binder = LocalBinder()
     override fun onBind(intent: Intent): IBinder = binder
 
-    // ---- UI Callbacks -------------------------------------------------------
     interface UiCallbacks {
         fun onTranscript(text: String)
         fun onResponse(text: String)
         fun onSystemMessage(text: String)
         fun onAmplitude(value: Float)
-        fun onDownloadProgress(pct: Int)          // NEW: live download progress
+        fun onDownloadProgress(pct: Int)
     }
     @Volatile var uiCallbacks: UiCallbacks? = null
 
-    // ---- Core components ----------------------------------------------------
     private lateinit var voiceRecognizer  : VoiceRecognizerManager
     private lateinit var modelExecutor    : LocalModelExecutor
     private lateinit var actionDispatcher : ActionDispatcher
@@ -62,35 +52,19 @@ class VoiceAssistantService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var wakeLock: PowerManager.WakeLock? = null
 
-    // =========================================================================
-    // Lifecycle
-    // =========================================================================
-
     override fun onCreate() {
         super.onCreate()
         PipelineLogger.log("SERVICE", "onCreate()")
-
         downloadManager = ModelDownloadManager(this)
-
-        // 1. Channel + foreground notification — MUST happen before slow work
         NotificationHelper.createChannel(this)
         startForeground(
             NotificationHelper.NOTIFICATION_ID,
             NotificationHelper.buildNotification(this, "Starting up…")
         )
-        PipelineLogger.log("SERVICE", "startForeground() done")
-
-        // 2. Wake lock
         val pm = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "VoiceAssistant::WakeLock"
-        ).also { it.acquire(30 * 60 * 1_000L) }   // 30-min max
-
-        // 3. TTS (must be on main thread)
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VoiceAssistant::WakeLock")
+            .also { it.acquire(30 * 60 * 1_000L) }
         initTts()
-
-        // 4. Start the full pipeline (download if needed, then init models)
         startPipeline()
     }
 
@@ -115,26 +89,22 @@ class VoiceAssistantService : Service() {
     }
 
     // =========================================================================
-    // Pipeline: download (if needed) → init models → IDLE
+    // Pipeline
     // =========================================================================
 
     private fun startPipeline() {
         serviceScope.launch {
             val model    = ModelConfig.ACTIVE
-            val modelDir = File(filesDir, MODEL_DIR_NAME)
+            val modelDir = File(filesDir, MODEL_DIR_NAME).also { it.mkdirs() }
 
-            // Wire components
             actionDispatcher = ActionDispatcher(applicationContext)
 
             voiceRecognizer = VoiceRecognizerManager(
                 modelPath   = File(modelDir, VOSK_MODEL_SUBDIR).absolutePath,
                 onPartial   = { text -> postUi { uiCallbacks?.onSystemMessage("Hearing: \"$text\"") } },
-                onFinal     = { text ->
-                    postUi { uiCallbacks?.onTranscript(text) }
-                    processTranscript(text)
-                },
-                onAmplitude = { amp -> postUi { uiCallbacks?.onAmplitude(amp) } },
-                onError     = { msg ->
+                onFinal     = { text -> postUi { uiCallbacks?.onTranscript(text) }; processTranscript(text) },
+                onAmplitude = { amp  -> postUi { uiCallbacks?.onAmplitude(amp) } },
+                onError     = { msg  ->
                     AssistantStateManager.transitionTo(AssistantStateManager.State.ERROR, msg)
                     postUi { uiCallbacks?.onSystemMessage("STT error: $msg") }
                 }
@@ -150,93 +120,136 @@ class VoiceAssistantService : Service() {
                 }
             )
 
-            // ------------------------------------------------------------------
-            // STEP A: Download model if not present
-            // ------------------------------------------------------------------
+            // ── STEP A: Download GGUF model if not present ─────────────────
             if (!downloadManager.isModelReady(model.fileName, minBytes = 100_000_000L)) {
-                PipelineLogger.log("SERVICE", "Model not found — starting auto-download")
-                updateNotification("Downloading model (0%)")
+                PipelineLogger.log("SERVICE", "GGUF model missing — downloading")
+                updateNotification("Downloading AI model (0%)")
                 AssistantStateManager.transitionTo(AssistantStateManager.State.LOADING_LLM)
-                postUi {
-                    uiCallbacks?.onSystemMessage(
-                        "📥 Downloading AI model (~935 MB) from Google Drive…\n" +
-                        "This only happens once. Please keep the app open."
-                    )
-                }
+                postUi { uiCallbacks?.onSystemMessage("📥 Downloading AI model (~935 MB)…\nThis only happens once.") }
 
-                var downloadOk = false
+                var ok = false
                 downloadManager.downloadModel(
-                    shareableLink  = "https://drive.google.com/file/d/${model.driveFileId}/view",
-                    destFileName   = model.fileName,
-                    expectedBytes  = model.expectedBytes,
-                    onProgress     = { pct ->
-                        updateNotification("Downloading model ($pct%)")
+                    shareableLink = "https://drive.google.com/file/d/${model.driveFileId}/view",
+                    destFileName  = model.fileName,
+                    expectedBytes = model.expectedBytes,
+                    onProgress    = { pct ->
+                        updateNotification("Downloading AI model ($pct%)")
                         postUi { uiCallbacks?.onDownloadProgress(pct) }
-                        // Show milestone messages in chat log
-                        if (pct % 25 == 0 && pct > 0) {
-                            postUi {
-                                uiCallbacks?.onSystemMessage("📥 Download: $pct% complete")
-                            }
-                        }
+                        if (pct % 25 == 0 && pct > 0)
+                            postUi { uiCallbacks?.onSystemMessage("📥 Download: $pct% complete") }
                     },
-                    onComplete     = { file ->
-                        PipelineLogger.log("SERVICE",
-                            "Download complete: ${file.length() / 1_000_000} MB")
-                        postUi {
-                            uiCallbacks?.onSystemMessage(
-                                "✅ Model downloaded (${file.length() / 1_000_000} MB). Loading…"
-                            )
-                        }
-                        downloadOk = true
+                    onComplete    = { file ->
+                        postUi { uiCallbacks?.onSystemMessage("✅ Model downloaded (${file.length()/1_000_000} MB). Loading…") }
+                        ok = true
                     },
-                    onError        = { msg ->
-                        AssistantStateManager.transitionTo(
-                            AssistantStateManager.State.ERROR,
-                            "Download failed: $msg"
-                        )
+                    onError       = { msg ->
+                        AssistantStateManager.transitionTo(AssistantStateManager.State.ERROR, "Download failed: $msg")
                         postUi { uiCallbacks?.onSystemMessage("⚠️ Download error: $msg") }
                     }
                 )
-
-                if (!downloadOk) {
-                    PipelineLogger.log("SERVICE", "Download failed — aborting pipeline")
-                    return@launch
-                }
-            } else {
-                PipelineLogger.log("SERVICE",
-                    "Model already present (${downloadManager.modelPath(model.fileName)})")
+                if (!ok) return@launch
             }
 
-            // ------------------------------------------------------------------
-            // STEP B: Load Vosk STT
-            // ------------------------------------------------------------------
+            // ── STEP A2: Download Vosk model if not present ────────────────
+            val voskDir = File(modelDir, VOSK_MODEL_SUBDIR)
+            if (!voskDir.exists() || !File(voskDir, "am/final.mdl").exists()) {
+                PipelineLogger.log("SERVICE", "Vosk model missing — downloading")
+                AssistantStateManager.transitionTo(AssistantStateManager.State.LOADING_STT)
+                updateNotification("Downloading speech model…")
+                postUi { uiCallbacks?.onSystemMessage("📥 Downloading speech model (~40 MB)…") }
+                downloadAndExtractVosk(modelDir)
+                if (AssistantStateManager.current == AssistantStateManager.State.ERROR) return@launch
+            }
+
+            // ── STEP B: Init Vosk STT ──────────────────────────────────────
             AssistantStateManager.transitionTo(AssistantStateManager.State.LOADING_STT)
             updateNotification("Loading speech engine…")
             voiceRecognizer.init()
             if (AssistantStateManager.current == AssistantStateManager.State.ERROR) return@launch
 
-            // ------------------------------------------------------------------
-            // STEP C: Load GGUF model via llama.cpp
-            // ------------------------------------------------------------------
+            // ── STEP C: Init LLM executor ──────────────────────────────────
             AssistantStateManager.transitionTo(AssistantStateManager.State.LOADING_LLM)
             updateNotification("Loading language model…")
             modelExecutor.init()
             if (AssistantStateManager.current == AssistantStateManager.State.ERROR) return@launch
 
-            // ------------------------------------------------------------------
-            // STEP D: Ready!
-            // ------------------------------------------------------------------
+            // ── STEP D: Ready ──────────────────────────────────────────────
             AssistantStateManager.transitionTo(AssistantStateManager.State.IDLE)
             updateNotification("Ready")
-            postUi {
-                uiCallbacks?.onSystemMessage("🟢 Assistant ready. Tap the mic button to speak!")
-            }
+            postUi { uiCallbacks?.onSystemMessage("🟢 Assistant ready. Tap the mic to speak!") }
             PipelineLogger.log("SERVICE", "Pipeline complete — IDLE")
         }
     }
 
     // =========================================================================
-    // Public control API (called from MainActivity)
+    // Vosk model download + extract
+    // =========================================================================
+
+    private suspend fun downloadAndExtractVosk(modelDir: File) = withContext(Dispatchers.IO) {
+        val zipFile = File(modelDir, "vosk-model.zip")
+        val destDir = File(modelDir, VOSK_MODEL_SUBDIR)
+        try {
+            // Download
+            val conn = URL(VOSK_ZIP_URL).openConnection() as HttpURLConnection
+            conn.connectTimeout = 15_000
+            conn.readTimeout    = 60_000
+            val total = conn.contentLengthLong
+            var downloaded = 0L
+            val buf = ByteArray(8192)
+
+            BufferedInputStream(conn.inputStream).use { inp ->
+                FileOutputStream(zipFile).use { out ->
+                    var read: Int
+                    while (inp.read(buf).also { read = it } != -1) {
+                        out.write(buf, 0, read)
+                        downloaded += read
+                        if (total > 0) {
+                            val pct = ((downloaded * 100) / total).toInt()
+                            updateNotification("Downloading speech model ($pct%)")
+                        }
+                    }
+                }
+            }
+            conn.disconnect()
+            PipelineLogger.log("SERVICE", "Vosk ZIP downloaded: ${zipFile.length()/1_000_000} MB")
+
+            // Extract — strip top-level folder, rename to vosk-model
+            updateNotification("Extracting speech model…")
+            postUi { uiCallbacks?.onSystemMessage("📦 Extracting speech model…") }
+            destDir.mkdirs()
+
+            ZipInputStream(FileInputStream(zipFile)).use { zip ->
+                var entry = zip.nextEntry
+                while (entry != null) {
+                    val parts   = entry.name.split("/", limit = 2)
+                    val relPath = if (parts.size > 1) parts[1] else ""
+                    if (relPath.isNotEmpty()) {
+                        val outFile = File(destDir, relPath)
+                        if (entry.isDirectory) outFile.mkdirs()
+                        else {
+                            outFile.parentFile?.mkdirs()
+                            FileOutputStream(outFile).use { zip.copyTo(it) }
+                        }
+                    }
+                    zip.closeEntry()
+                    entry = zip.nextEntry
+                }
+            }
+            zipFile.delete()
+            postUi { uiCallbacks?.onSystemMessage("✅ Speech model ready!") }
+            PipelineLogger.log("SERVICE", "Vosk extracted to ${destDir.absolutePath}")
+
+        } catch (e: Exception) {
+            zipFile.delete()
+            val msg = "Failed to download speech model: ${e.message}"
+            Log.e(TAG, msg, e)
+            AssistantStateManager.transitionTo(AssistantStateManager.State.ERROR, msg)
+            postUi { uiCallbacks?.onSystemMessage("⚠️ $msg") }
+        }
+    }
+
+    // =========================================================================
+    // Public API
     // =========================================================================
 
     fun startListening() {
@@ -255,14 +268,13 @@ class VoiceAssistantService : Service() {
     fun stopListening() = voiceRecognizer.stopListening()
 
     // =========================================================================
-    // Internal pipeline
+    // Internal
     // =========================================================================
 
     private fun processTranscript(transcript: String) {
         serviceScope.launch {
             AssistantStateManager.transitionTo(AssistantStateManager.State.PROCESSING)
             updateNotification("Processing…")
-
             val raw = modelExecutor.infer(transcript)
             if (raw.isNullOrBlank()) {
                 if (AssistantStateManager.current != AssistantStateManager.State.ERROR) {
@@ -271,21 +283,15 @@ class VoiceAssistantService : Service() {
                 }
                 return@launch
             }
-
             AssistantStateManager.transitionTo(AssistantStateManager.State.EXECUTING)
             updateNotification("Executing…")
             val result = actionDispatcher.dispatch(raw)
             postUi { uiCallbacks?.onResponse(result.responseText) }
             tts?.speak(result.responseText, TextToSpeech.QUEUE_FLUSH, null, "tts")
-
             AssistantStateManager.transitionTo(AssistantStateManager.State.IDLE)
             updateNotification("Ready")
         }
     }
-
-    // =========================================================================
-    // Helpers
-    // =========================================================================
 
     private fun initTts() {
         tts = TextToSpeech(this) { status ->
@@ -302,9 +308,6 @@ class VoiceAssistantService : Service() {
 
     private fun updateNotification(status: String) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
-        nm.notify(
-            NotificationHelper.NOTIFICATION_ID,
-            NotificationHelper.buildNotification(this, status)
-        )
+        nm.notify(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, status))
     }
 }
