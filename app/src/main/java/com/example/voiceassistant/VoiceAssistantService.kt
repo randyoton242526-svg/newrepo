@@ -6,8 +6,11 @@ import android.os.Binder
 import android.os.IBinder
 import android.os.PowerManager
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlin.coroutines.resume
+import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
@@ -51,6 +54,9 @@ class VoiceAssistantService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var wakeLock: PowerManager.WakeLock? = null
+
+    // Prevents Vosk from processing its own TTS output
+    @Volatile private var isSpeaking = false
 
     override fun onCreate() {
         super.onCreate()
@@ -101,10 +107,19 @@ class VoiceAssistantService : Service() {
 
             voiceRecognizer = VoiceRecognizerManager(
                 modelPath   = File(modelDir, VOSK_MODEL_SUBDIR).absolutePath,
-                onPartial   = { text -> postUi { uiCallbacks?.onSystemMessage("Hearing: \"$text\"") } },
-                onFinal     = { text -> postUi { uiCallbacks?.onTranscript(text) }; processTranscript(text) },
-                onAmplitude = { amp  -> postUi { uiCallbacks?.onAmplitude(amp) } },
-                onError     = { msg  ->
+                onPartial   = { text ->
+                    // Ignore partials while TTS is speaking to avoid feedback
+                    if (!isSpeaking)
+                        postUi { uiCallbacks?.onSystemMessage("Hearing: \"$text\"") }
+                },
+                onFinal     = { text ->
+                    if (!isSpeaking && text.isNotBlank()) {
+                        postUi { uiCallbacks?.onTranscript(text) }
+                        processTranscript(text)
+                    }
+                },
+                onAmplitude = { amp -> postUi { uiCallbacks?.onAmplitude(amp) } },
+                onError     = { msg ->
                     AssistantStateManager.transitionTo(AssistantStateManager.State.ERROR, msg)
                     postUi { uiCallbacks?.onSystemMessage("STT error: $msg") }
                 }
@@ -175,8 +190,8 @@ class VoiceAssistantService : Service() {
 
             // ── STEP D: Ready ──────────────────────────────────────────────
             AssistantStateManager.transitionTo(AssistantStateManager.State.IDLE)
-            updateNotification("Ready")
-            postUi { uiCallbacks?.onSystemMessage("🟢 Assistant ready. Tap the mic to speak!") }
+            updateNotification("Ready — tap mic to speak")
+            postUi { uiCallbacks?.onSystemMessage("🟢 Tap the mic button to speak a command!") }
             PipelineLogger.log("SERVICE", "Pipeline complete — IDLE")
         }
     }
@@ -189,7 +204,6 @@ class VoiceAssistantService : Service() {
         val zipFile = File(modelDir, "vosk-model.zip")
         val destDir = File(modelDir, VOSK_MODEL_SUBDIR)
         try {
-            // Download
             val conn = URL(VOSK_ZIP_URL).openConnection() as HttpURLConnection
             conn.connectTimeout = 15_000
             conn.readTimeout    = 60_000
@@ -211,9 +225,7 @@ class VoiceAssistantService : Service() {
                 }
             }
             conn.disconnect()
-            PipelineLogger.log("SERVICE", "Vosk ZIP downloaded: ${zipFile.length()/1_000_000} MB")
 
-            // Extract — strip top-level folder, rename to vosk-model
             updateNotification("Extracting speech model…")
             postUi { uiCallbacks?.onSystemMessage("📦 Extracting speech model…") }
             destDir.mkdirs()
@@ -255,48 +267,81 @@ class VoiceAssistantService : Service() {
     fun startListening() {
         if (AssistantStateManager.current != AssistantStateManager.State.IDLE) return
         AssistantStateManager.transitionTo(AssistantStateManager.State.LISTENING)
-        updateNotification("Listening…")
-        serviceScope.launch {
-            voiceRecognizer.startListening()
-            if (AssistantStateManager.current == AssistantStateManager.State.LISTENING) {
-                AssistantStateManager.transitionTo(AssistantStateManager.State.IDLE)
-                updateNotification("Ready")
-            }
+        updateNotification("Listening… speak now")
+        serviceScope.launch { voiceRecognizer.startListening() }
+    }
+
+    fun stopListening() {
+        voiceRecognizer.stopListening()
+        if (AssistantStateManager.current == AssistantStateManager.State.LISTENING) {
+            AssistantStateManager.transitionTo(AssistantStateManager.State.IDLE)
+            updateNotification("Ready — tap mic to speak")
         }
     }
 
-    fun stopListening() = voiceRecognizer.stopListening()
-
     // =========================================================================
-    // Internal
+    // Command processing — stops mic FIRST, speaks AFTER, then returns to IDLE
     // =========================================================================
 
     private fun processTranscript(transcript: String) {
         serviceScope.launch {
+            // ── 1. STOP LISTENING IMMEDIATELY (prevents TTS feedback loop) ──
+            voiceRecognizer.stopListening()
+
             AssistantStateManager.transitionTo(AssistantStateManager.State.PROCESSING)
             updateNotification("Processing…")
+            PipelineLogger.log("LLM", "Processing: \"$transcript\"")
+
             val raw = modelExecutor.infer(transcript)
             if (raw.isNullOrBlank()) {
-                if (AssistantStateManager.current != AssistantStateManager.State.ERROR) {
-                    AssistantStateManager.transitionTo(AssistantStateManager.State.IDLE)
-                    updateNotification("Ready")
-                }
+                AssistantStateManager.transitionTo(AssistantStateManager.State.IDLE)
+                updateNotification("Ready — tap mic to speak")
                 return@launch
             }
+
             AssistantStateManager.transitionTo(AssistantStateManager.State.EXECUTING)
             updateNotification("Executing…")
             val result = actionDispatcher.dispatch(raw)
             postUi { uiCallbacks?.onResponse(result.responseText) }
-            tts?.speak(result.responseText, TextToSpeech.QUEUE_FLUSH, null, "tts")
+            PipelineLogger.log("LLM", "Response: ${result.responseText}")
+
+            // ── 2. SPEAK RESPONSE and WAIT until TTS fully finishes ────────
+            speakAndWait(result.responseText)
+
+            // ── 3. Only NOW return to IDLE (user must tap mic again) ────────
+            delay(500) // extra buffer so mic doesn't catch end of speech
             AssistantStateManager.transitionTo(AssistantStateManager.State.IDLE)
-            updateNotification("Ready")
+            updateNotification("Ready — tap mic to speak")
+            PipelineLogger.log("SERVICE", "Back to IDLE after response")
         }
     }
+
+    /** Speaks text via TTS and suspends until the utterance is fully done. */
+    private suspend fun speakAndWait(text: String) = suspendCancellableCoroutine { cont ->
+        isSpeaking = true
+        val uid = "utt_${System.currentTimeMillis()}"
+        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(id: String?)  {}
+            override fun onDone(id: String?)   { isSpeaking = false; if (cont.isActive) cont.resume(Unit) }
+            @Deprecated("Deprecated in Java")
+            override fun onError(id: String?)  { isSpeaking = false; if (cont.isActive) cont.resume(Unit) }
+        })
+        val result = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, uid)
+        if (tts == null || result == TextToSpeech.ERROR) {
+            isSpeaking = false
+            if (cont.isActive) cont.resume(Unit)
+        }
+    }
+
+    // =========================================================================
+    // Helpers
+    // =========================================================================
 
     private fun initTts() {
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 tts?.language = Locale.US
+                tts?.setSpeechRate(0.95f)
                 PipelineLogger.log("TTS", "TTS ready")
             }
         }
